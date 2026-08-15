@@ -4,11 +4,23 @@ Bot Zalo tự động ghi nhận thu chi: thành viên gửi ảnh hoá đơn v�
 
 ## Luồng hoạt động
 
-1. Thành viên gửi ảnh hoá đơn vào nhóm Zalo Team 05, có tag bot trong caption/text (ví dụ `@Bot Thu - Chi Team 05`).
-2. Server liên tục hỏi Zalo (polling qua API `getUpdates`) xem có tin nhắn mới không.
-3. Khi có ảnh mới kèm tag bot, server tải ảnh về, gửi cho OpenAI (gpt-4o-mini) để đọc và trích xuất: số tiền, ngày, đơn vị, nội dung, thu/chi.
-4. Server ghi một dòng mới vào Google Sheet.
-5. Bot trả lời xác nhận trong nhóm.
+1. Thành viên gửi ảnh hoá đơn vào nhóm Zalo Team 05, kèm theo **bất kỳ chữ gì** trong CÙNG 1 tin nhắn (ví dụ gõ `chi ăn trưa` rồi đính kèm ảnh, gửi chung 1 lần). Không bắt buộc phải gõ đúng tên bot.
+2. Bot xử lý ngay khi nhận được.
+
+### Vì sao bắt buộc phải kèm chữ, và vì sao không hỗ trợ "gửi ảnh trước, tag sau"?
+
+Đã kiểm thử thực tế và xác nhận: **Zalo Bot Platform không đẩy sự kiện ảnh (`message.image.received`) qua `getUpdates` nếu ảnh gửi không kèm theo chữ nào** — ảnh gửi trơn (không caption) sẽ không bao giờ tới được bot, dù gửi trong nhóm hay riêng. Đây là giới hạn của nền tảng (Beta), không phải lỗi code.
+
+Vì vậy:
+- Không thể làm luồng "gửi ảnh trước, gửi tag ở 1 tin nhắn riêng sau đó" — vì bot sẽ không hề biết có ảnh nào được gửi cho tới khi có chữ đi kèm.
+- Vì ảnh luôn bắt buộc phải có chữ đi kèm để tới được bot, nên bot không yêu cầu chữ đó phải đúng là tên bot nữa — gõ gì cũng được, miễn có nội dung.
+- Nếu ai đó tag bot bằng 1 tin nhắn text thuần (không kèm ảnh), bot sẽ trả lời nhắc lại cách dùng đúng.
+
+Cả 2 cách đều xử lý giống nhau ở bước sau:
+1. Server liên tục hỏi Zalo (polling qua API `getUpdates`) xem có tin nhắn mới không.
+2. Khi ghép được đủ ảnh + tag, server tải ảnh về, gửi cho OpenAI (gpt-4o-mini) để đọc và trích xuất: số tiền, ngày, đơn vị, nội dung, thu/chi.
+3. Server ghi một dòng mới vào Google Sheet.
+4. Bot trả lời xác nhận trong nhóm.
 
 ### Vì sao dùng Polling thay vì Webhook?
 
@@ -98,11 +110,11 @@ Vì bot dùng polling (vòng lặp chạy liên tục trong app, không đợi r
 ## Bước 7 — Thêm bot vào nhóm & test
 
 1. Thêm bot vào nhóm Zalo Team 05.
-2. Gửi 1 ảnh hoá đơn vào nhóm, kèm tag bot trong caption, ví dụ: `@Bot Thu - Chi Team 05 nhập liệu nha`.
+2. Gửi 1 ảnh hoá đơn vào nhóm, kèm theo bất kỳ chữ gì trong CÙNG 1 tin nhắn (ví dụ: `chi ăn trưa`). **Lưu ý:** phải đính kèm ảnh và gõ chữ trong cùng 1 lần gửi — ảnh gửi riêng không kèm chữ sẽ không tới được bot (giới hạn của nền tảng Zalo, xem phần "Luồng hoạt động" ở trên).
 3. Đợi vài giây → xem log server (Render → Logs) để kiểm tra dòng `[handler] event=message.image.received ...`.
 4. Kiểm tra Google Sheet đã có dòng mới chưa, và bot có trả lời xác nhận trong nhóm không.
 
-Nếu tag bot bằng tên khác với "Bot Thu - Chi Team 05" (ví dụ đổi tên bot sau này), cập nhật biến `BOT_MENTION_KEYWORDS` trong `.env`/Render Environment, liệt kê các cách gọi cách nhau bởi dấu phẩy.
+Nếu ai đó tag bot bằng 1 tin nhắn text thuần (không kèm ảnh), bot sẽ tự trả lời nhắc lại cách dùng đúng — không cần chỉnh gì thêm. Biến `BOT_MENTION_KEYWORDS` trong `.env`/Render Environment chỉ còn dùng để nhận diện tin nhắn text kiểu này, không ảnh hưởng đến việc xử lý ảnh.
 
 ## Giới hạn hiện tại
 

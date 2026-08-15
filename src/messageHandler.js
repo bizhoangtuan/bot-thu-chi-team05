@@ -2,9 +2,7 @@ const { sendMessage, downloadPhoto } = require("./zaloClient");
 const { extractBillData } = require("./ocrExtract");
 const { appendExpenseRow } = require("./sheets");
 
-// Các từ khoá coi là "tag bot" khi xuất hiện trong caption/text tin nhắn.
-// Tên hiển thị thật của bot có thể khác với BOT_TOKEN name (vd: "Bot Thu - Chi Team 05"),
-// nên liệt kê thêm biến thể nếu cần qua BOT_MENTION_KEYWORDS trong .env.
+// Các từ khoá coi là "tag bot" khi xuất hiện trong tin nhắn TEXT (không kèm ảnh).
 const BOT_MENTION_KEYWORDS = (
   process.env.BOT_MENTION_KEYWORDS ||
   "bot thu - chi team 05,bot thu chi team 05,@bot thu - chi team 05,@bot thu chi team 05"
@@ -16,27 +14,12 @@ const BOT_MENTION_KEYWORDS = (
 // Chống xử lý trùng lặp (best-effort, chỉ tồn tại trong bộ nhớ khi app đang chạy)
 const processedMessageIds = new Set();
 
-// Ảnh gửi trước, chưa tag — lưu tạm chờ tin nhắn tag gửi sau (tiện thao tác trên điện thoại,
-// không cần vừa đính kèm ảnh vừa gõ tag trong cùng 1 lần gửi).
-// key: "<chatId>:<senderId>" -> { photoUrl, messageId, sender, receivedAt }
-const PENDING_PHOTO_TTL_MS = 15 * 60 * 1000; // 15 phút
-const pendingPhotos = new Map();
-
-function rememberPendingPhoto(chatId, senderId, data) {
-  pendingPhotos.set(`${chatId}:${senderId}`, { ...data, receivedAt: Date.now() });
-}
-
-function takePendingPhoto(chatId, senderId) {
-  const key = `${chatId}:${senderId}`;
-  const entry = pendingPhotos.get(key);
-  if (!entry) return null;
-  pendingPhotos.delete(key);
-  if (Date.now() - entry.receivedAt > PENDING_PHOTO_TTL_MS) return null; // đã hết hạn chờ
-  return entry;
-}
-
-// Tài liệu Zalo ghi trường ảnh là "photo", nhưng thực tế trả về là "photo_url".
-// Vẫn thử thêm vài tên trường phổ biến khác để phòng thay đổi trong tương lai.
+// QUAN TRỌNG (đã xác nhận qua kiểm thử thực tế): Zalo Bot Platform KHÔNG đẩy sự kiện
+// "message.image.received" qua getUpdates nếu ảnh gửi không kèm theo chữ (caption) nào.
+// Vì vậy bot không có cách nào biết được có ảnh "gửi trước, chưa tag" đang chờ — nên không thể
+// làm luồng "gửi ảnh trước, tag sau bằng tin nhắn riêng". Ảnh luôn phải kèm ít nhất 1 chữ mới
+// tới được bot. Do đó: hễ ảnh có kèm chữ (bất kỳ nội dung gì) là xử lý luôn, không bắt buộc phải
+// đúng tên bot nữa (gõ đúng tên bot lúc này chỉ gây thêm thao tác thừa).
 function extractPhotoUrl(message) {
   return (
     message.photo_url ||
@@ -57,25 +40,8 @@ function isBotTagged(message) {
   return BOT_MENTION_KEYWORDS.some((kw) => text.includes(kw));
 }
 
-// Khi người dùng dùng tính năng "Trả lời" (reply/quote) 1 tin nhắn ảnh trên Zalo, tin nhắn text
-// nhận được có thể kèm theo dữ liệu tin nhắn được trả lời (tên trường chưa xác định chắc chắn -
-// thử nhiều tên phổ biến, đồng thời log raw JSON để xác nhận khi cần).
-function extractQuotedPhotoUrl(message) {
-  const quote =
-    message.quote ||
-    message.reply_to_message ||
-    message.replied_message ||
-    message.quoted_message ||
-    message.msg_reply ||
-    message.reply ||
-    message.reply_message ||
-    null;
-  if (!quote) return null;
-  return extractPhotoUrl(quote);
-}
-
 /**
- * Xử lý 1 sự kiện tin nhắn nhận được từ Zalo (webhook hoặc polling).
+ * Xử lý 1 sự kiện tin nhắn nhận được từ Zalo (qua polling getUpdates).
  * @param {{event_name: string, message: object}} result
  */
 async function handleIncomingMessage(result) {
@@ -99,23 +65,24 @@ async function handleImageMessage(message) {
   processedMessageIds.add(message.message_id);
 
   const chatId = message.chat.id;
-  const senderId = message.from?.id;
   const sender = message.from?.display_name || "Không rõ";
   const photoUrl = extractPhotoUrl(message);
+  const caption = (message.caption || message.text || "").trim();
 
   if (!photoUrl) {
     console.error("[handler] Không tìm thấy link ảnh trong message:", JSON.stringify(message));
     return;
   }
 
-  if (isBotTagged(message)) {
-    // Ảnh + tag gửi chung 1 tin nhắn -> xử lý luôn
-    await processBillPhoto({ chatId, sender, photoUrl, messageId: message.message_id });
-  } else {
-    // Chưa tag -> lưu chờ tin nhắn tag gửi sau (trong vòng 15 phút)
-    rememberPendingPhoto(chatId, senderId, { photoUrl, messageId: message.message_id, sender });
-    console.log(`[handler] Lưu ảnh chờ tag từ "${sender}" trong chat ${chatId}`);
+  if (!caption) {
+    // Trên lý thuyết trường hợp này hiếm khi xảy ra (ảnh không chữ thường không tới được bot),
+    // nhưng phòng khi Zalo thay đổi hành vi, log lại để biết.
+    console.log("[handler] Ảnh không kèm chữ, bỏ qua:", message.message_id);
+    return;
   }
+
+  // Ảnh có kèm bất kỳ chữ gì -> coi như yêu cầu ghi nhận hoá đơn, xử lý luôn.
+  await processBillPhoto({ chatId, sender, photoUrl, messageId: message.message_id });
 }
 
 async function handleTextMessage(message) {
@@ -123,34 +90,14 @@ async function handleTextMessage(message) {
   if (processedMessageIds.has(message.message_id)) return;
   processedMessageIds.add(message.message_id);
 
-  // Log tạm để xác định tên trường chứa dữ liệu ảnh được "trả lời" (reply/quote), nếu có.
-  console.log("[handler] DEBUG raw text message (đã tag bot):", JSON.stringify(message));
-
   const chatId = message.chat.id;
-  const senderId = message.from?.id;
-  const sender = message.from?.display_name || "Không rõ";
 
-  // Ưu tiên 1: người dùng dùng tính năng "Trả lời" (reply) trực tiếp vào tin nhắn ảnh.
-  const quotedPhotoUrl = extractQuotedPhotoUrl(message);
-  if (quotedPhotoUrl) {
-    await processBillPhoto({ chatId, sender, photoUrl: quotedPhotoUrl, messageId: message.message_id });
-    return;
-  }
-
-  // Ưu tiên 2: ảnh gửi trước đó (không reply), tag gửi tách rời sau -> lấy từ bộ nhớ tạm.
-  const pending = takePendingPhoto(chatId, senderId);
-  if (!pending) {
-    // Tag bot bằng text nhưng không có ảnh nào đang chờ xử lý -> bỏ qua, tránh trả lời tràn lan
-    // cho các tin nhắn chit-chat có nhắc tên bot mà không liên quan tới hoá đơn.
-    return;
-  }
-
-  await processBillPhoto({
+  // Tag bot bằng tin nhắn text thuần (không có ảnh) -> nhắc lại cách dùng đúng, tránh gây
+  // hiểu lầm rằng bot đã "chờ sẵn" 1 ảnh nào đó từ trước (Zalo không cho phép làm vậy).
+  await sendMessage(
     chatId,
-    sender: pending.sender,
-    photoUrl: pending.photoUrl,
-    messageId: pending.messageId,
-  });
+    `👋 Để ghi nhận hoá đơn, gửi ảnh hoá đơn kèm theo vài chữ bất kỳ trong CÙNG 1 tin nhắn nhé (ví dụ gõ "chi ăn trưa" rồi đính kèm ảnh, gửi chung 1 lần). Ảnh gửi riêng không kèm chữ mình sẽ không nhận được.`
+  );
 }
 
 /**
