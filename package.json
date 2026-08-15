@@ -1,0 +1,22 @@
+{
+  "name": "bot-thu-chi-team05",
+  "version": "1.0.0",
+  "description": "Zalo Bot ghi nhận thu chi Team 05: nhận ảnh hoá đơn trong nhóm (qua polling getUpdates), OCR bằng OpenAI Vision (gpt-4o-mini), ghi vào Google Sheet",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "remove-webhook": "node src/deleteWebhook.js"
+  },
+  "dependencies": {
+    "openai": "^4.77.0",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "googleapis": "^144.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
