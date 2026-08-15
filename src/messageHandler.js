@@ -16,13 +16,31 @@ const BOT_MENTION_KEYWORDS = (
 // Chống xử lý trùng lặp (best-effort, chỉ tồn tại trong bộ nhớ khi app đang chạy)
 const processedMessageIds = new Set();
 
-// Tài liệu Zalo ghi trường ảnh là "photo", nhưng để phòng trường hợp thực tế trả về
-// tên khác, thử lần lượt các tên trường phổ biến. Xem log "DEBUG raw message object"
-// để biết chính xác tên trường thật và rút gọn lại danh sách này nếu cần.
+// Ảnh gửi trước, chưa tag — lưu tạm chờ tin nhắn tag gửi sau (tiện thao tác trên điện thoại,
+// không cần vừa đính kèm ảnh vừa gõ tag trong cùng 1 lần gửi).
+// key: "<chatId>:<senderId>" -> { photoUrl, messageId, sender, receivedAt }
+const PENDING_PHOTO_TTL_MS = 15 * 60 * 1000; // 15 phút
+const pendingPhotos = new Map();
+
+function rememberPendingPhoto(chatId, senderId, data) {
+  pendingPhotos.set(`${chatId}:${senderId}`, { ...data, receivedAt: Date.now() });
+}
+
+function takePendingPhoto(chatId, senderId) {
+  const key = `${chatId}:${senderId}`;
+  const entry = pendingPhotos.get(key);
+  if (!entry) return null;
+  pendingPhotos.delete(key);
+  if (Date.now() - entry.receivedAt > PENDING_PHOTO_TTL_MS) return null; // đã hết hạn chờ
+  return entry;
+}
+
+// Tài liệu Zalo ghi trường ảnh là "photo", nhưng thực tế trả về là "photo_url".
+// Vẫn thử thêm vài tên trường phổ biến khác để phòng thay đổi trong tương lai.
 function extractPhotoUrl(message) {
   return (
-    message.photo ||
     message.photo_url ||
+    message.photo ||
     message.image ||
     message.image_url ||
     message.file_url ||
@@ -39,8 +57,25 @@ function isBotTagged(message) {
   return BOT_MENTION_KEYWORDS.some((kw) => text.includes(kw));
 }
 
+// Khi người dùng dùng tính năng "Trả lời" (reply/quote) 1 tin nhắn ảnh trên Zalo, tin nhắn text
+// nhận được có thể kèm theo dữ liệu tin nhắn được trả lời (tên trường chưa xác định chắc chắn -
+// thử nhiều tên phổ biến, đồng thời log raw JSON để xác nhận khi cần).
+function extractQuotedPhotoUrl(message) {
+  const quote =
+    message.quote ||
+    message.reply_to_message ||
+    message.replied_message ||
+    message.quoted_message ||
+    message.msg_reply ||
+    message.reply ||
+    message.reply_message ||
+    null;
+  if (!quote) return null;
+  return extractPhotoUrl(quote);
+}
+
 /**
- * Xử lý 1 sự kiện tin nhắn nhận được từ Zalo (dùng chung cho cả webhook và polling).
+ * Xử lý 1 sự kiện tin nhắn nhận được từ Zalo (webhook hoặc polling).
  * @param {{event_name: string, message: object}} result
  */
 async function handleIncomingMessage(result) {
@@ -52,30 +87,76 @@ async function handleIncomingMessage(result) {
     `[handler] event=${eventName} chat_type=${message.chat?.chat_type} from=${message.from?.display_name} text=${message.text || message.caption || ""}`
   );
 
-  if (eventName !== "message.image.received") return;
+  if (eventName === "message.image.received") {
+    await handleImageMessage(message);
+  } else if (eventName === "message.text.received") {
+    await handleTextMessage(message);
+  }
+}
 
-  // Debug: in toàn bộ object message để xác nhận đúng tên trường chứa link ảnh
-  // (tài liệu ghi là "photo" nhưng thực tế trả về có thể khác — xem log này để đối chiếu).
-  console.log("[handler] DEBUG raw message object:", JSON.stringify(message));
-
+async function handleImageMessage(message) {
   if (processedMessageIds.has(message.message_id)) return;
   processedMessageIds.add(message.message_id);
 
-  if (!isBotTagged(message)) {
-    console.log("[handler] Ảnh không tag bot, bỏ qua.");
-    return;
-  }
-
   const chatId = message.chat.id;
+  const senderId = message.from?.id;
   const sender = message.from?.display_name || "Không rõ";
   const photoUrl = extractPhotoUrl(message);
 
   if (!photoUrl) {
-    console.error("[handler] Không tìm thấy link ảnh trong message. Xem DEBUG log ở trên để bổ sung tên trường vào extractPhotoUrl().");
-    await sendMessage(chatId, `⚠️ @${sender} Mình nhận được ảnh nhưng chưa đọc được link ảnh (lỗi kỹ thuật), đang được khắc phục.`);
+    console.error("[handler] Không tìm thấy link ảnh trong message:", JSON.stringify(message));
     return;
   }
 
+  if (isBotTagged(message)) {
+    // Ảnh + tag gửi chung 1 tin nhắn -> xử lý luôn
+    await processBillPhoto({ chatId, sender, photoUrl, messageId: message.message_id });
+  } else {
+    // Chưa tag -> lưu chờ tin nhắn tag gửi sau (trong vòng 15 phút)
+    rememberPendingPhoto(chatId, senderId, { photoUrl, messageId: message.message_id, sender });
+    console.log(`[handler] Lưu ảnh chờ tag từ "${sender}" trong chat ${chatId}`);
+  }
+}
+
+async function handleTextMessage(message) {
+  if (!isBotTagged(message)) return;
+  if (processedMessageIds.has(message.message_id)) return;
+  processedMessageIds.add(message.message_id);
+
+  // Log tạm để xác định tên trường chứa dữ liệu ảnh được "trả lời" (reply/quote), nếu có.
+  console.log("[handler] DEBUG raw text message (đã tag bot):", JSON.stringify(message));
+
+  const chatId = message.chat.id;
+  const senderId = message.from?.id;
+  const sender = message.from?.display_name || "Không rõ";
+
+  // Ưu tiên 1: người dùng dùng tính năng "Trả lời" (reply) trực tiếp vào tin nhắn ảnh.
+  const quotedPhotoUrl = extractQuotedPhotoUrl(message);
+  if (quotedPhotoUrl) {
+    await processBillPhoto({ chatId, sender, photoUrl: quotedPhotoUrl, messageId: message.message_id });
+    return;
+  }
+
+  // Ưu tiên 2: ảnh gửi trước đó (không reply), tag gửi tách rời sau -> lấy từ bộ nhớ tạm.
+  const pending = takePendingPhoto(chatId, senderId);
+  if (!pending) {
+    // Tag bot bằng text nhưng không có ảnh nào đang chờ xử lý -> bỏ qua, tránh trả lời tràn lan
+    // cho các tin nhắn chit-chat có nhắc tên bot mà không liên quan tới hoá đơn.
+    return;
+  }
+
+  await processBillPhoto({
+    chatId,
+    sender: pending.sender,
+    photoUrl: pending.photoUrl,
+    messageId: pending.messageId,
+  });
+}
+
+/**
+ * Tải ảnh, gọi OpenAI đọc hoá đơn, ghi vào Sheet, trả lời xác nhận trong chat.
+ */
+async function processBillPhoto({ chatId, sender, photoUrl, messageId }) {
   try {
     const { buffer, contentType } = await downloadPhoto(photoUrl);
     const billData = await extractBillData(buffer, contentType);
@@ -97,7 +178,7 @@ async function handleIncomingMessage(result) {
       billDate: billData.date,
       photoUrl,
       confidence: billData.confidence,
-      messageId: message.message_id,
+      messageId,
     });
 
     const amountText = Number(billData.amount).toLocaleString("vi-VN");
@@ -111,7 +192,7 @@ async function handleIncomingMessage(result) {
         `Người gửi: ${sender}${confidenceNote}`
     );
   } catch (err) {
-    console.error("[handler] Lỗi xử lý tin nhắn:", err);
+    console.error("[handler] Lỗi xử lý ảnh hoá đơn:", err);
   }
 }
 
